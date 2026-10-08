@@ -1,0 +1,11 @@
+# 核心训练 / 推理（src/）
+torch>=2.0
+torchvision>=0.15
+onnx>=1.14
+pillow>=9.0
+numpy>=1.23
+
+# YOLO 分割增强流水线（yolo_pipeline/，可选）
+ultralytics>=8.0
+opencv-python>=4.8
+matplotlib>=3.7
