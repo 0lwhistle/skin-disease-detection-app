@@ -1,95 +1,87 @@
-# -*- coding: utf-8 -*-
-"""人体校验模型训练（皮肤病检测 APP 的第一级过滤）。
+"""人体校验模型（人体 / 非人体二分类）训练。
 
-在 APP 的推理流程中，先用该模型判断照片是否为清晰的人体皮肤照，
-过滤非人体图片后再交给 24 类病种分类模型，降低误分类率。
+该模型是 APP 两级推理的第一级：先过滤非人体照片，再交给病种
+分类模型，降低误分类率。参赛原始实现为单输出打分头且无验证集
+（逐轮覆盖保存）；重构版规范化为标准二分类头，并随机划出验证集、
+按最佳验证准确率保存权重。
 
-说明：与交付权重、安卓端 ONNX 保持一致，本模型采用单输出打分头
-（``Linear(1000, 1)``），原始实现按分类方式训练，这里保持原样。
-
-数据目录采用 ImageFolder 格式（两个子目录）::
+类别编号按数据目录名的字母序生成，推理侧 ``predict.BODY_CLASSES``
+需与其保持一致::
 
     data_dir/
-        human_body/      # 人体皮肤照
-        not_human_body/  # 非人体图片
+        human_body/      -> 类别 0
+        not_human_body/  -> 类别 1
 
 用法::
 
-    python train_body_verify.py --data-dir ../data/body-verify --epochs 3
+    python -m src.train_body_verify --data-dir data/body-verify --epochs 3
 """
 
 import argparse
-import os
-import time
+from pathlib import Path
 
-from torch import nn
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+import torch
+from torch.utils.data import DataLoader, Subset, random_split
+from torchvision import datasets
 
-from models import build_body_verify_model, get_device
-
-
-def build_transform():
-    return transforms.Compose([
-        transforms.Resize([224, 224]),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomVerticalFlip(p=0.5),
-        transforms.RandomRotation(degrees=10),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
+from .datasets import build_transforms
+from .engine import fit, seed_everything
+from .models import build_body_verify_model, get_device
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="人体校验模型训练")
-    parser.add_argument("--data-dir", required=True, help="ImageFolder 数据目录（人体 / 非人体两个子目录）")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="人体校验二分类模型训练")
+    parser.add_argument("--data-dir", required=True, help="ImageFolder 数据目录（human_body / not_human_body）")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--save-dir", default="checkpoints")
-    parser.add_argument("--save-name", default="body_verify_last.pth")
+    parser.add_argument("--val-fraction", type=float, default=0.1, help="从训练数据中划出做验证的比例")
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save-dir", type=Path, default=Path("checkpoints"))
+    parser.add_argument("--save-name", default="body_verify_best.pth")
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
     args = parse_args()
+    seed_everything(args.seed)
     device = get_device()
-    print(f"使用设备: {device}")
+    print(f"设备: {device}")
 
-    dataset = datasets.ImageFolder(args.data_dir, build_transform())
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-    print(f"数据量: {len(dataset)} 张，类别: {dataset.classes}")
+    transforms_map = build_transforms()
+    # 训练 / 验证需要不同变换（验证不做增强），而 random_split 的两个子集
+    # 共享同一个底层 dataset，因此用相同种子对两个 ImageFolder 各切一次，
+    # 保证两边拿到的是同一批图片、各自的变换
+    train_full = datasets.ImageFolder(args.data_dir, transforms_map["train"])
+    val_full = datasets.ImageFolder(args.data_dir, transforms_map["val"])
+    n_val = int(len(train_full) * args.val_fraction)
+    n_train = len(train_full) - n_val
+    generator = torch.Generator().manual_seed(args.seed)
+    train_indices, val_indices = random_split(train_full, [n_train, n_val], generator=generator)
+    train_set = Subset(train_full, train_indices.indices)
+    val_set = Subset(val_full, val_indices.indices)
+    print(f"类别映射: {dict(zip(train_full.class_to_idx.values(), train_full.class_to_idx.keys()))}")
+    print(f"训练集 {len(train_set)} 张 / 验证集 {len(val_set)} 张")
+
+    dataloaders = {
+        "train": DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
+                            num_workers=args.num_workers, pin_memory=torch.cuda.is_available()),
+        "val": DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
+                          num_workers=args.num_workers, pin_memory=torch.cuda.is_available()),
+    }
 
     model = build_body_verify_model().to(device)
-    criterion = nn.CrossEntropyLoss().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    os.makedirs(args.save_dir, exist_ok=True)
-    save_path = os.path.join(args.save_dir, args.save_name)
-    start_time = time.time()
-
-    for epoch in range(args.epochs):
-        model.train()
-        epoch_loss, correct = 0.0, 0
-        for step, (img, label) in enumerate(dataloader):
-            img, label = img.to(device), label.to(device)
-            optimizer.zero_grad()
-            output = model(img)
-            loss = criterion(output, label)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-            correct += (output.argmax(1) == label).sum().item()
-            if (step + 1) % 20 == 0:
-                print(f"  epoch {epoch + 1}  batch {step + 1}/{len(dataloader)}  loss={loss.item():.4f}")
-        print(
-            f"第 {epoch + 1}/{args.epochs} 轮结束  "
-            f"loss={epoch_loss / len(dataset):.5f}  acc={correct / len(dataset) * 100:.2f}%"
-        )
-        torch.save(model.state_dict(), save_path)
-
-    print(f"训练完成，总耗时 {time.time() - start_time:.1f}s，权重已保存: {save_path}")
+    args.save_dir.mkdir(parents=True, exist_ok=True)
+    fit(
+        model,
+        dataloaders=dataloaders,
+        epochs=args.epochs,
+        lr=args.lr,
+        device=device,
+        save_path=str(args.save_dir / args.save_name),
+    )
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ flowchart LR
 | --- | --- |
 | 数据规模 | 约 1.9 万张皮肤图像，24 类（训练 / 测试分集） |
 | 骨干网络 | ResNet50（ImageNet 预训练 + 迁移学习） |
-| 测试集准确率 | ≈ 78%（24 类） |
+| 测试集准确率 | ≈ 78%（24 类，参赛交付模型） |
 | 交付形式 | PyTorch → ONNX，安卓 APP 端侧离线推理 |
 
 <details>
@@ -57,17 +57,21 @@ flowchart LR
 ```text
 skin-disease-detection-app/
 ├── src/
-│   ├── classes.py                 # 24 类类别表（与数据集目录顺序一致）
-│   ├── models.py                  # 模型构建（与交付权重 / ONNX 结构一致）
-│   ├── train_skin_classifier.py   # 第一阶段：24 分类模型全量训练
-│   ├── train_finetune.py          # 第二阶段：低学习率续训微调
-│   ├── train_body_verify.py       # 人体校验模型训练
-│   ├── test_body_verify.py        # 人体校验模型批量测试
-│   └── predict.py                 # 两级推理 + ONNX 导出
+│   ├── classes.py            # 24 类类别表（与数据集目录顺序一致）
+│   ├── models.py             # 模型工厂（标准 fc 头 + 参赛旧结构兼容开关）
+│   ├── datasets.py           # ImageFolder 数据集构建与增强策略
+│   ├── engine.py             # 训练/评估引擎（单轮训练、评估、最佳权重保存）
+│   ├── train.py              # 训练入口（全量训练 / 低学习率微调两阶段）
+│   ├── train_body_verify.py  # 人体校验二分类模型训练（含验证集划分）
+│   ├── predict.py            # 两级推理（人体校验 → 病种分类，单张/批量）
+│   └── export.py             # ONNX 导出（安卓端约定 input/output 节点名）
 ├── yolo_pipeline/
-│   └── skin_analysis.py           # YOLO11-seg 人体分割 + CNN 分类增强流水线
-├── docs/images/                   # 示例结果图
+│   └── skin_analysis.py      # YOLO11-seg 人体分割 + CNN 分类增强流水线
+├── tests/
+│   └── test_smoke.py         # 冒烟测试（模型前向、旧结构兼容、ONNX 导出）
+├── docs/images/              # 示例结果图
 ├── requirements.txt
+├── LICENSE
 └── README.md
 ```
 
@@ -79,11 +83,11 @@ skin-disease-detection-app/
 pip install -r requirements.txt
 ```
 
-Python ≥ 3.9；训练建议使用 CUDA GPU，推理 CPU 即可。
+Python ≥ 3.9；训练建议 CUDA GPU，推理 CPU 即可。
 
 ### 2. 数据准备
 
-数据按 torchvision `ImageFolder` 格式组织，目录名即类别名（与 [`src/classes.py`](src/classes.py) 顺序一致）：
+数据按 torchvision `ImageFolder` 格式组织，类别目录名与 [`src/classes.py`](src/classes.py) 顺序一致（训练时会自动校验并提示错位）：
 
 ```text
 data/skin-disease/
@@ -95,60 +99,78 @@ data/skin-disease/
     └── ...（与 train 同 24 类）
 ```
 
+人体校验模型的数据为两个目录：`human_body/`（类别 0）与 `not_human_body/`（类别 1）。
+
 ### 3. 训练
 
 ```bash
-cd src
+# 第一阶段：全量训练（Adam + StepLR 动态学习率，按最佳验证准确率保存权重）
+python -m src.train --data-dir data/skin-disease --epochs 30
 
-# 第一阶段：全量训练（Adam + StepLR 动态学习率，按最佳测试准确率保存权重）
-python train_skin_classifier.py --data-dir ../data/skin-disease --epochs 30
-
-# 第二阶段：以 1e-6 低学习率续训微调
-python train_finetune.py \
+# 第二阶段：加载第一阶段最佳权重，低学习率微调收敛
+python -m src.train --data-dir data/skin-disease \
     --init-from checkpoints/skin_classifier_best.pth \
-    --data-dir ../data/skin-disease \
-    --epochs 5 --lr 1e-6
+    --epochs 5 --lr 1e-6 --step-size 2 \
+    --save-name skin_classifier_finetuned_best.pth
 
-# （可选）训练人体校验模型
-python train_body_verify.py --data-dir ../data/body-verify --epochs 3
+# 人体校验模型（自动从数据中划出 10% 做验证）
+python -m src.train_body_verify --data-dir data/body-verify --epochs 3
 ```
 
 ### 4. 导出 ONNX 与推理
 
 ```bash
-# 导出两个模型为 ONNX（输入 1x3x224x224，节点名 input / output）
-python predict.py --export-onnx --export-dir ../exports
+# 导出两个模型为 ONNX（输入 1x3x224x224，节点名 input / output，交付安卓端）
+python -m src.export --export-dir exports
 
-# 单张图片两级推理
-python predict.py --image demo.jpg
+# 两级推理：单张或目录批量
+python -m src.predict --image demo.jpg
+python -m src.predict --image-dir imgs/ --body-threshold 0.5
 ```
 
 ### 5. 多人场景增强流水线（可选）
 
 ```bash
-cd yolo_pipeline
-# CNN 权重为训练得到的 state_dict；YOLO 权重从 ultralytics 官方下载
-python skin_analysis.py --image test1.jpg \
-    --cnn-weights cnn_model --yolo-weights yolo11n-seg.pt
+# YOLO 权重从 ultralytics 官方下载 yolo11n-seg.pt；CNN 权重为本仓库训练产物
+python -m yolo_pipeline.skin_analysis --image test1.jpg \
+    --cnn-weights checkpoints/skin_classifier_best.pth --yolo-weights yolo11n-seg.pt
+
+# 加载参赛时期的旧结构权重（如当年的 cnn_model）时加 --legacy-head
+python -m yolo_pipeline.skin_analysis --image test1.jpg \
+    --cnn-weights cnn_model --legacy-head
 ```
 
-结果（叠加掩码/检测框/标签的可视化图 + 逐人预测文本）保存在 `results/` 下。
+结果（叠加掩码 / 检测框 / 标签的可视化图 + 逐人预测文本报告）保存在 `results/` 下。
+
+### 6. 测试
+
+```bash
+python -m pytest tests -q     # 或 python -m tests.test_smoke
+```
+
+覆盖模型前向形状、参赛旧结构兼容性与 ONNX 导出链路，不依赖真实权重与数据。
 
 ## 技术要点
 
-- **迁移学习**：ImageNet 预训练 ResNet50 上叠加新分类头 fine-tune；网络结构保持与已交付权重、安卓端 ONNX 完全一致（原 1000 类 fc 层保留 + `add_linear` 新头），保证本仓库代码可直接加载历史权重复现导出。
-- **数据增强**：随机水平/垂直翻转、±15° 随机旋转、中心裁剪、颜色抖动，提升真实手机拍摄场景下的鲁棒性。
-- **训练策略**：Adam + `StepLR` 动态学习率（每 7 轮 ×0.3）；逐 epoch 测试并只保留最佳测试准确率权重；再用 1e-6 低学习率二阶段微调收敛。
-- **端侧交付**：固定输入 `1×3×224×224`，ONNX 输入/输出节点统一命名 `input` / `output`，方便安卓端集成；两级模型（人体校验 + 病种分类）均为独立 ONNX 文件。
-- **工程实践**：数据 → 训练 → 微调 → 导出 → 推理全链路脚本化，CLI 参数化，类别表单点维护。
+- **迁移学习**：ImageNet 预训练 ResNet50，标准做法替换 fc 分类头（2048 → num_classes）fine-tune；保留 `legacy_head` 开关兼容加载参赛时期的旧结构权重。
+- **数据增强**：随机翻转 / ±15° 旋转 / 颜色抖动，针对「手机拍摄、光照多变」的真实场景设计；验证与测试只做标准预处理，保证评估口径一致。
+- **训练策略**：Adam + `StepLR` 动态学习率；按最佳验证准确率保存权重；低学习率二阶段微调；固定随机种子，训练流程可复现。
+- **工程化**：训练循环收敛到统一引擎（`engine.py`），避免脚本间复制粘贴；数据类别顺序自动校验，防止标签错位；人体校验模型独立划分验证集，避免「用全量数据训练再自评」的泄漏问题。
+- **端侧交付**：固定输入 `1×3×224×224`，ONNX 输入/输出节点统一命名 `input` / `output`，两级模型各为独立文件，方便安卓端按名集成；冒烟测试覆盖导出链路。
 
 ## 模型权重说明
 
-模型权重单文件超过 100 MB，未纳入 Git 仓库。按「快速开始」步骤训练后，用 `predict.py --export-onnx` 即可复现 ONNX 导出流程。
+模型权重单文件超过 100 MB，未纳入 Git 仓库。按「快速开始」步骤训练后，用 `python -m src.export` 即可复现 ONNX 导出流程；参赛时期的旧结构权重可用 `legacy_head=True`（或 `--legacy-head`）加载。
 
 ## 仓库说明
 
-本仓库由 2024 年大二时期的项目代码整理而来：移除了本地路径硬编码、统一为 CLI 参数化，训练逻辑与模型结构保持原始实现不变；`yolo_pipeline/` 为 2026 年 1 月追加的多人场景增强方案。
+本仓库为 2024 年大二参赛代码的工程化重构版（2026 整理开源）。训练配方与系统设计保持参赛时不变，代码做了规范化重构：
+
+- 分类头统一为标准 fc 替换（参赛版为「保留 1000 类 fc + 叠加新线性头」的非常规结构，已封装进 `legacy_head` 兼容开关）；
+- 人体校验模型修复为标准二分类头，两级过滤在推理侧真正生效（参赛版为单输出打分头，Python 侧 argmax 恒返回人体，实际由移动端按分数阈值过滤）；
+- 公共训练循环收敛到 `engine.py`，脚本只负责装配；补充随机种子、类别校验、验证集划分与冒烟测试。
+
+表格中的准确率由参赛交付模型（原始结构）测得。
 
 ## 免责声明
 

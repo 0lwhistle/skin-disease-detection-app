@@ -1,4 +1,4 @@
-# 核心训练 / 推理（src/）
+# 核心训练 / 推理 / 导出（src/）
 torch>=2.0
 torchvision>=0.15
 onnx>=1.14
@@ -9,3 +9,6 @@ numpy>=1.23
 ultralytics>=8.0
 opencv-python>=4.8
 matplotlib>=3.7
+
+# 测试（可选）
+pytest>=7.0
